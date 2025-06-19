@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <title>チケット在庫管理（バーコード認証付き）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: sans-serif;
+      padding: 10px;
+      background: #f9f9f9;
+    }
+    .ticket {
+      background: white;
+      padding: 15px;
+      margin-bottom: 10px;
+      border-radius: 8px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    button {
+      padding: 8px 12px;
+      margin-top: 5px;
+    }
+    #adminMenu {
+      margin-top: 20px;
+      display: none;
+    }
+    #barcodeRegion {
+      position: relative;
+      width: 100%;
+      max-width: 400px;
+      margin-top: 10px;
+    }
+    #barcodeVideo {
+      width: 100%;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h2>?? チケット在庫一覧</h2>
+  <div id="ticketList"></div>
+  <hr />
+  <button onclick="startPurchase()"> 購入する</button>
+  <button onclick="openAdmin()"> 管理者メニュー</button>
+
+  <div id="adminMenu">
+    <h3>管理者メニュー</h3>
+    <input id="newName" placeholder="券種名" />
+    <input id="newStock" type="number" placeholder="初期在庫" />
+    <button onclick="addTicket()">追加</button>
+    <button onclick="resetAll()">在庫リセット</button>
+  </div>
+
+  <div id="barcodeRegion" style="display:none;">
+    <div id="barcodeVideo"></div>
+    <p>バーコードをカメラにかざしてください…</p>
+  </div>
+
+  <!-- QuaggaJS CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/quagga@0.12.1/dist/quagga.min.js"></script>
+
+  <script>
+    let db;
+    const DB_NAME = "TicketDB";
+    const STORE_NAME = "tickets";
+    const UID_KEY = "barcodeUID";
+
+    async function initDB() {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        db.createObjectStore(STORE_NAME, { keyPath: "id", autoIncrement: true });
+      };
+      req.onsuccess = (e) => {
+        db = e.target.result;
+        loadTickets();
+        checkFirstLaunch();
+      };
+    }
+
+    function loadTickets() {
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.getAll();
+      req.onsuccess = () => {
+        displayTickets(req.result);
+      };
+    }
+
+    function displayTickets(tickets) {
+      const list = document.getElementById("ticketList");
+      list.innerHTML = "";
+      tickets.forEach(t => {
+        const div = document.createElement("div");
+        div.className = "ticket";
+        div.innerHTML = `<b>${t.name}</b><br>在庫：<span id="stock-${t.id}">${t.stock}</span>`;
+        list.appendChild(div);
+      });
+    }
+
+    function addTicket() {
+      requireAuth(async () => {
+        const name = document.getElementById("newName").value.trim();
+        const stock = parseInt(document.getElementById("newStock").value);
+        if (!name || isNaN(stock)) return alert("正しい名前と在庫を入力してください");
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        tx.objectStore(STORE_NAME).add({ name, stock });
+        tx.oncomplete = () => {
+          loadTickets();
+          alert("チケットを追加しました");
+        };
+      });
+    }
+
+    function resetAll() {
+      requireAuth(() => {
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        tx.objectStore(STORE_NAME).clear();
+        tx.oncomplete = () => {
+          loadTickets();
+          alert("在庫をリセットしました");
+        };
+      });
+    }
+
+    function startPurchase() {
+      requireAuth(() => {
+        const id = prompt("購入するチケットのID（1など）を入力してください");
+        if (!id) return;
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        const store = tx.objectStore(STORE_NAME);
+        const getReq = store.get(Number(id));
+        getReq.onsuccess = () => {
+          const ticket = getReq.result;
+          if (ticket && ticket.stock > 0) {
+            ticket.stock--;
+            store.put(ticket);
+            document.getElementById(`stock-${ticket.id}`).textContent = ticket.stock;
+            alert("購入しました");
+          } else {
+            alert("在庫なし or 該当なし");
+          }
+        };
+      });
+    }
+
+    function openAdmin() {
+      requireAuth(() => {
+        document.getElementById("adminMenu").style.display = "block";
+      });
+    }
+
+    async function checkFirstLaunch() {
+      const savedUID = localStorage.getItem(UID_KEY);
+      if (!savedUID) {
+        alert("初回：管理者バーコードをスキャンして登録してください");
+        try {
+          const uid = await scanBarcode();
+          if (uid) {
+            localStorage.setItem(UID_KEY, uid);
+            alert("管理者バーコードを登録しました");
+          }
+        } catch (e) {
+          alert("バーコードの読み取りに失敗しました。再読み込みしてください。");
+        }
+      }
+    }
+
+    async function requireAuth(callback) {
+      const savedUID = localStorage.getItem(UID_KEY);
+      try {
+        const uid = await scanBarcode();
+        if (uid === savedUID) {
+          callback();
+        } else {
+          alert("認証失敗：バーコードが一致しません");
+        }
+      } catch (e) {
+        alert("バーコードの読み取りに失敗しました");
+      }
+    }
+
+    function scanBarcode() {
+      return new Promise((resolve, reject) => {
+        document.getElementById("barcodeRegion").style.display = "block";
+
+        Quagga.init({
+          inputStream : {
+            name : "Live",
+            type : "LiveStream",
+            target: document.querySelector('#barcodeVideo'),
+            constraints: {
+              facingMode: "environment" // 背面カメラ
+            },
+          },
+          decoder : {
+            readers : [
+              "code_128_reader",
+              "ean_reader",
+              "ean_8_reader",
+              "code_39_reader",
+              "code_39_vin_reader",
+              "codabar_reader",
+              "upc_reader",
+              "upc_e_reader",
+              "i2of5_reader"
+            ]
+          }
+        }, (err) => {
+          if (err) {
+            document.getElementById("barcodeRegion").style.display = "none";
+            return reject(err);
+          }
+          Quagga.start();
+        });
+
+        let detected = false;
+        Quagga.onDetected(data => {
+          if (detected) return;
+          detected = true;
+          const code = data.codeResult.code;
+          Quagga.stop();
+          document.getElementById("barcodeRegion").style.display = "none";
+          resolve(code);
+        });
+
+        // 10秒でタイムアウト
+        setTimeout(() => {
+          if (!detected) {
+            Quagga.stop();
+            document.getElementById("barcodeRegion").style.display = "none";
+            reject("バーコード読み取りタイムアウト");
+          }
+        }, 10000);
+      });
+    }
+
+    initDB();
+  </script>
+</body>
+</html>
